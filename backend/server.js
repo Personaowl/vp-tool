@@ -20,8 +20,24 @@ app.use('/uploads', express.static(path.join(root, 'uploads')));
 app.use(express.static(clientRoot));
 
 function getRoom(id) {
-  if (!rooms.has(id)) rooms.set(id, { code: defaultCode, strokes: [], clients: new Set() });
+  if (!rooms.has(id)) rooms.set(id, { files: { 'main.cpp': defaultCode() }, strokes: [], problems: loadProblems(id), clients: new Set() });
   return rooms.get(id);
+}
+
+function loadProblems(id) {
+  const uploadDir = path.join(root, 'uploads');
+  if (!fs.existsSync(uploadDir)) return [];
+  const legacy = path.join(uploadDir, `${id}.pdf`);
+  const items = fs.existsSync(legacy) ? [{ id: 'legacy', name: `${id}.pdf`, url: `/uploads/${id}.pdf` }] : [];
+  for (const file of fs.readdirSync(uploadDir)) {
+    const prefix = `${id}-`;
+    if (file.startsWith(prefix) && file.endsWith('.pdf')) items.push({ id: file.slice(prefix.length, -4), name: file.slice(prefix.length), url: `/uploads/${file}` });
+  }
+  return items;
+}
+
+function isCppFileName(value) {
+  return typeof value === 'string' && /^[a-zA-Z0-9_-]{1,56}\.cpp$/.test(value);
 }
 
 function defaultCode() {
@@ -36,7 +52,34 @@ app.post('/api/rooms', (_req, res) => {
 
 app.get('/api/rooms/:id', (req, res) => {
   const room = getRoom(req.params.id);
-  res.json({ id: req.params.id, code: room.code, strokes: room.strokes });
+  res.json({ id: req.params.id, files: room.files, strokes: room.strokes, problems: room.problems });
+});
+
+app.post('/api/rooms/:id/problem', express.raw({ type: 'application/pdf', limit: '20mb' }), (req, res) => {
+  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(req.params.id)) return res.status(400).json({ error: '无效房间 ID' });
+  if (!Buffer.isBuffer(req.body) || req.body.length === 0) return res.status(400).json({ error: '请选择 PDF 文件' });
+  const uploads = path.join(root, 'uploads');
+  fs.mkdirSync(uploads, { recursive: true });
+  const room = getRoom(req.params.id);
+  const name = String(req.query.name || 'problem.pdf').replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').slice(0, 80) || 'problem.pdf';
+  const id = randomBytes(4).toString('hex');
+  const fileName = `${req.params.id}-${id}.pdf`;
+  fs.writeFileSync(path.join(uploads, fileName), req.body);
+  const problem = { id, name, url: `/uploads/${fileName}` };
+  room.problems.push(problem);
+  for (const client of room.clients) if (client.readyState === 1) client.send(JSON.stringify({ type: 'pdf-updated', problems: room.problems }));
+  res.json({ problem, problems: room.problems });
+});
+
+app.delete('/api/rooms/:id/problem/:pdfId', (req, res) => {
+  const room = getRoom(req.params.id);
+  const index = room.problems.findIndex(item => item.id === req.params.pdfId);
+  if (index < 0) return res.status(404).json({ error: '题面不存在' });
+  const fileName = path.basename(room.problems[index].url);
+  fs.rmSync(path.join(root, 'uploads', fileName), { force: true });
+  room.problems.splice(index, 1);
+  for (const client of room.clients) if (client.readyState === 1) client.send(JSON.stringify({ type: 'pdf-updated', problems: room.problems }));
+  res.json({ problems: room.problems });
 });
 
 app.post('/api/run', (req, res) => {
@@ -68,24 +111,60 @@ app.post('/api/run', (req, res) => {
   });
 });
 
+app.post('/api/check', (req, res) => {
+  const { language = 'cpp', code } = req.body || {};
+  if (language !== 'cpp' || typeof code !== 'string') return res.status(400).json({ error: '当前仅支持 C++' });
+  const dir = path.join(require('node:os').tmpdir(), `vp-check-${Date.now()}-${randomBytes(3).toString('hex')}`);
+  fs.mkdirSync(dir, { recursive: true });
+  const source = path.join(dir, 'main.cpp');
+  fs.writeFileSync(source, code, 'utf8');
+  const cleanup = () => fs.rmSync(dir, { recursive: true, force: true });
+  const compiler = spawn('g++', ['-std=c++17', '-fsyntax-only', source]);
+  let diagnostics = '';
+  compiler.stderr.on('data', chunk => { diagnostics += chunk; });
+  compiler.on('error', error => { cleanup(); res.status(500).json({ error: `无法启动 g++: ${error.message}` }); });
+  compiler.on('close', exitCode => { cleanup(); res.json({ ok: exitCode === 0, diagnostics: diagnostics.slice(0, 12000) }); });
+});
+
 const wss = new WebSocketServer({ server, path: '/ws' });
 wss.on('connection', (socket, request) => {
   const url = new URL(request.url, `http://${request.headers.host}`);
   const id = url.searchParams.get('room');
   if (!id) return socket.close(1008, 'room is required');
   const room = getRoom(id);
+  const peerId = randomBytes(4).toString('hex');
+  socket.peerId = peerId;
   room.clients.add(socket);
-  socket.send(JSON.stringify({ type: 'snapshot', code: room.code, strokes: room.strokes }));
+  socket.send(JSON.stringify({ type: 'snapshot', peerId, peers: [...room.clients].filter(client => client !== socket).map(client => client.peerId), voicePeers: [...room.clients].filter(client => client.voiceActive).map(client => client.peerId), files: room.files, strokes: room.strokes, problems: room.problems }));
+  for (const client of room.clients) if (client !== socket && client.readyState === 1) client.send(JSON.stringify({ type: 'peer-joined', peerId }));
   socket.on('message', raw => {
     try {
-      const message = JSON.parse(raw.toString());
-      if (message.type === 'code' && typeof message.code === 'string') room.code = message.code;
+      let message = JSON.parse(raw.toString());
+      if (message.type === 'code' && isCppFileName(message.fileName) && typeof message.code === 'string' && Object.hasOwn(room.files, message.fileName)) room.files[message.fileName] = message.code;
+      if (message.type === 'file-create' && isCppFileName(message.fileName) && !Object.hasOwn(room.files, message.fileName)) {
+        room.files[message.fileName] = typeof message.code === 'string' ? message.code : defaultCode();
+        message = { type: 'file-created', fileName: message.fileName, code: room.files[message.fileName] };
+      }
       if (message.type === 'stroke' && message.stroke) room.strokes.push(message.stroke);
+      if (message.type === 'board-update' && message.item?.id) {
+        const index = room.strokes.findIndex(item => item.id === message.item.id);
+        if (index >= 0) room.strokes[index] = message.item;
+      }
       if (message.type === 'clear') room.strokes = [];
-      for (const client of room.clients) if (client !== socket && client.readyState === 1) client.send(JSON.stringify(message));
+      if (message.type === 'voice-state') socket.voiceActive = Boolean(message.active);
+      if (message.type === 'signal' && message.to && message.data) {
+        const target = [...room.clients].find(client => client.peerId === message.to);
+        if (target?.readyState === 1) target.send(JSON.stringify({ type: 'signal', from: peerId, data: message.data }));
+      } else {
+        const broadcast = message.type === 'voice-state' ? { ...message, peerId } : message;
+        for (const client of room.clients) if (client !== socket && client.readyState === 1) client.send(JSON.stringify(broadcast));
+      }
     } catch { /* Ignore malformed messages from a browser. */ }
   });
-  socket.on('close', () => room.clients.delete(socket));
+  socket.on('close', () => {
+    room.clients.delete(socket);
+    for (const client of room.clients) if (client.readyState === 1) client.send(JSON.stringify({ type: 'peer-left', peerId }));
+  });
 });
 
 app.get('*', (_req, res) => res.sendFile(path.join(clientRoot, 'index.html')));

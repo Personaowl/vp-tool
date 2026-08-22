@@ -4,12 +4,15 @@
   "scripts": {
     "dev": "concurrently \"npm:dev:server\" \"npm:dev:client\"",
     "dev:server": "node backend/server.js",
-    "dev:client": "vite frontend --host 0.0.0.0",
-    "build": "vite build frontend"
+    "dev:client": "vite --host 0.0.0.0",
+    "build": "vite build"
   },
   "dependencies": {
+    "@monaco-editor/react": "^4.6.0",
     "cors": "^2.8.5",
     "express": "^4.21.2",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
     "ws": "^8.18.0"
   },
   "devDependencies": {
