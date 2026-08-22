@@ -20,7 +20,7 @@ app.use('/uploads', express.static(path.join(root, 'uploads')));
 app.use(express.static(clientRoot));
 
 function getRoom(id) {
-  if (!rooms.has(id)) rooms.set(id, { files: { 'main.cpp': defaultCode() }, strokes: [], problems: loadProblems(id), clients: new Set() });
+  if (!rooms.has(id)) rooms.set(id, { files: { 'main.cpp': defaultCode() }, strokes: [], problems: loadProblems(id), testCasesByFile: { 'main.cpp': defaultTestCases() }, clients: new Set() });
   return rooms.get(id);
 }
 
@@ -42,6 +42,14 @@ function isCppFileName(value) {
 
 function defaultCode() {
   return '#include <bits/stdc++.h>\nusing namespace std;\n\nint main() {\n    ios::sync_with_stdio(false);\n    cin.tie(nullptr);\n\n    cout << "Hello, VP!" << endl;\n    return 0;\n}\n';
+}
+
+function defaultTestCases() {
+  return [{ id: 'sample-1', name: '样例 1', input: '', expected: '' }];
+}
+
+function isTestCases(value) {
+  return Array.isArray(value) && value.length > 0 && value.length <= 30 && value.every(item => item && typeof item.id === 'string' && item.id.length <= 100 && typeof item.name === 'string' && typeof item.input === 'string' && typeof item.expected === 'string' && item.name.length <= 80 && item.input.length <= 20000 && item.expected.length <= 20000);
 }
 
 app.post('/api/rooms', (_req, res) => {
@@ -127,22 +135,37 @@ app.post('/api/check', (req, res) => {
 });
 
 const wss = new WebSocketServer({ server, path: '/ws' });
+const heartbeat = setInterval(() => {
+  for (const socket of wss.clients) {
+    if (socket.missedHeartbeats >= 2) { socket.terminate(); continue; }
+    socket.missedHeartbeats += 1;
+    socket.ping();
+  }
+}, 20000);
+server.on('close', () => clearInterval(heartbeat));
 wss.on('connection', (socket, request) => {
   const url = new URL(request.url, `http://${request.headers.host}`);
   const id = url.searchParams.get('room');
   if (!id) return socket.close(1008, 'room is required');
   const room = getRoom(id);
   const peerId = randomBytes(4).toString('hex');
+  const requestedName = url.searchParams.get('name') || '';
+  const name = requestedName.trim().slice(0, 32) || `队员-${peerId.slice(0, 4)}`;
   socket.peerId = peerId;
+  socket.displayName = name;
+  socket.missedHeartbeats = 0;
+  socket.on('pong', () => { socket.missedHeartbeats = 0; });
   room.clients.add(socket);
-  socket.send(JSON.stringify({ type: 'snapshot', peerId, peers: [...room.clients].filter(client => client !== socket).map(client => client.peerId), voicePeers: [...room.clients].filter(client => client.voiceActive).map(client => client.peerId), files: room.files, strokes: room.strokes, problems: room.problems }));
-  for (const client of room.clients) if (client !== socket && client.readyState === 1) client.send(JSON.stringify({ type: 'peer-joined', peerId }));
+  const peerInfo = client => ({ peerId: client.peerId, name: client.displayName });
+  socket.send(JSON.stringify({ type: 'snapshot', peerId, name, peers: [...room.clients].filter(client => client !== socket).map(peerInfo), voicePeers: [...room.clients].filter(client => client.voiceActive).map(client => client.peerId), files: room.files, strokes: room.strokes, problems: room.problems, testCasesByFile: room.testCasesByFile }));
+  for (const client of room.clients) if (client !== socket && client.readyState === 1) client.send(JSON.stringify({ type: 'peer-joined', ...peerInfo(socket) }));
   socket.on('message', raw => {
     try {
       let message = JSON.parse(raw.toString());
       if (message.type === 'code' && isCppFileName(message.fileName) && typeof message.code === 'string' && Object.hasOwn(room.files, message.fileName)) room.files[message.fileName] = message.code;
       if (message.type === 'file-create' && isCppFileName(message.fileName) && !Object.hasOwn(room.files, message.fileName)) {
         room.files[message.fileName] = typeof message.code === 'string' ? message.code : defaultCode();
+        room.testCasesByFile[message.fileName] = defaultTestCases();
         message = { type: 'file-created', fileName: message.fileName, code: room.files[message.fileName] };
       }
       if (message.type === 'stroke' && message.stroke) room.strokes.push(message.stroke);
@@ -151,6 +174,9 @@ wss.on('connection', (socket, request) => {
         if (index >= 0) room.strokes[index] = message.item;
       }
       if (message.type === 'clear') room.strokes = [];
+      if (message.type === 'test-cases' && isCppFileName(message.fileName) && isTestCases(message.testCases)) {
+        room.testCasesByFile[message.fileName] = message.testCases;
+      }
       if (message.type === 'voice-state') socket.voiceActive = Boolean(message.active);
       if (message.type === 'signal' && message.to && message.data) {
         const target = [...room.clients].find(client => client.peerId === message.to);
