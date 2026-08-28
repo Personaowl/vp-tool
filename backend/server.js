@@ -157,7 +157,7 @@ wss.on('connection', (socket, request) => {
   socket.on('pong', () => { socket.missedHeartbeats = 0; });
   room.clients.add(socket);
   const peerInfo = client => ({ peerId: client.peerId, name: client.displayName });
-  socket.send(JSON.stringify({ type: 'snapshot', peerId, name, peers: [...room.clients].filter(client => client !== socket).map(peerInfo), voicePeers: [...room.clients].filter(client => client.voiceActive).map(client => client.peerId), files: room.files, strokes: room.strokes, problems: room.problems, testCasesByFile: room.testCasesByFile }));
+  socket.send(JSON.stringify({ type: 'snapshot', peerId, name, peers: [...room.clients].filter(client => client !== socket).map(peerInfo), files: room.files, strokes: room.strokes, problems: room.problems, testCasesByFile: room.testCasesByFile }));
   for (const client of room.clients) if (client !== socket && client.readyState === 1) client.send(JSON.stringify({ type: 'peer-joined', ...peerInfo(socket) }));
   socket.on('message', raw => {
     try {
@@ -177,14 +177,7 @@ wss.on('connection', (socket, request) => {
       if (message.type === 'test-cases' && isCppFileName(message.fileName) && isTestCases(message.testCases)) {
         room.testCasesByFile[message.fileName] = message.testCases;
       }
-      if (message.type === 'voice-state') socket.voiceActive = Boolean(message.active);
-      if (message.type === 'signal' && message.to && message.data) {
-        const target = [...room.clients].find(client => client.peerId === message.to);
-        if (target?.readyState === 1) target.send(JSON.stringify({ type: 'signal', from: peerId, data: message.data }));
-      } else {
-        const broadcast = message.type === 'voice-state' ? { ...message, peerId } : message;
-        for (const client of room.clients) if (client !== socket && client.readyState === 1) client.send(JSON.stringify(broadcast));
-      }
+      for (const client of room.clients) if (client !== socket && client.readyState === 1) client.send(JSON.stringify(message));
     } catch { /* Ignore malformed messages from a browser. */ }
   });
   socket.on('close', () => {
