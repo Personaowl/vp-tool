@@ -30,6 +30,7 @@ header { height: 36px; flex: 0 0 36px; display: flex; align-items: center; justi
 .activity.active { color: #ffffff; }
 .activity.active::before { content: ""; position: absolute; left: 0; top: 6px; bottom: 6px; width: 2px; background: #ffffff; }
 .workspace { flex: 1; min-width: 0; min-height: 0; display: flex; background: #1e1e1e; }
+.sync-placeholder { flex: 1; display: grid; place-items: center; color: #999999; font-size: 15px; }
 .code-view { display: flex; flex: 1; min-width: 0; min-height: 0; }
 .explorer { width: 218px; flex: 0 0 218px; background: #252526; border-right: 1px solid #1e1e1e; }
 .explorer-title { height: 40px; display: flex; align-items: center; padding: 0 18px; color: #bbbbbb; font-size: 13px; letter-spacing: .4px; }
