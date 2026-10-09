@@ -20,7 +20,7 @@ app.use('/uploads', express.static(path.join(root, 'uploads')));
 app.use(express.static(clientRoot));
 
 function getRoom(id) {
-  if (!rooms.has(id)) rooms.set(id, { files: { 'main.cpp': defaultCode() }, strokes: [], problems: loadProblems(id), testCasesByFile: { 'main.cpp': defaultTestCases() }, clients: new Set() });
+  if (!rooms.has(id)) rooms.set(id, { files: { 'main.cpp': defaultCode() }, strokes: [], problems: loadProblems(id), testCasesByFile: { 'main.cpp': defaultTestCases() }, messages: [], editMode: 'collaborative', editor: null, clients: new Set() });
   return rooms.get(id);
 }
 
@@ -157,16 +157,54 @@ wss.on('connection', (socket, request) => {
   socket.on('pong', () => { socket.missedHeartbeats = 0; });
   room.clients.add(socket);
   const peerInfo = client => ({ peerId: client.peerId, name: client.displayName });
-  socket.send(JSON.stringify({ type: 'snapshot', peerId, name, peers: [...room.clients].filter(client => client !== socket).map(peerInfo), files: room.files, strokes: room.strokes, problems: room.problems, testCasesByFile: room.testCasesByFile }));
+  const editState = () => ({ editMode: room.editMode, editor: room.editor });
+  const broadcastEditState = () => {
+    for (const client of room.clients) if (client.readyState === 1) client.send(JSON.stringify({ type: 'edit-state', ...editState() }));
+  };
+  const rejectEdit = reason => socket.send(JSON.stringify({ type: 'edit-rejected', reason, ...editState(), files: room.files, testCasesByFile: room.testCasesByFile }));
+  socket.send(JSON.stringify({ type: 'snapshot', peerId, name, peers: [...room.clients].filter(client => client !== socket).map(peerInfo), files: room.files, strokes: room.strokes, problems: room.problems, testCasesByFile: room.testCasesByFile, messages: room.messages, ...editState() }));
   for (const client of room.clients) if (client !== socket && client.readyState === 1) client.send(JSON.stringify({ type: 'peer-joined', ...peerInfo(socket) }));
   socket.on('message', raw => {
     try {
       let message = JSON.parse(raw.toString());
+      if (!message || typeof message !== 'object') return;
+      if (message.type === 'chat' && (typeof message.text !== 'string' || !message.text.trim())) return;
+      if (message.type === 'edit-mode') {
+        if (!['collaborative', 'single'].includes(message.editMode)) return;
+        if (room.editMode !== message.editMode) { room.editMode = message.editMode; room.editor = null; }
+        broadcastEditState();
+        return;
+      }
+      if (message.type === 'edit-acquire') {
+        if (room.editMode !== 'single') return;
+        if (room.editor && room.editor.peerId !== peerId) return rejectEdit('编辑权已被其他队员领取');
+        room.editor = peerInfo(socket);
+        broadcastEditState();
+        return;
+      }
+      if (message.type === 'edit-release') {
+        if (room.editor?.peerId === peerId) { room.editor = null; broadcastEditState(); }
+        return;
+      }
+      if (['code', 'file-create', 'file-delete', 'test-cases'].includes(message.type)) {
+        if (room.editMode === 'single' && room.editor?.peerId !== peerId) return rejectEdit('单机比赛模式下，请先领取编辑权');
+        if (!isCppFileName(message.fileName)) return rejectEdit('无效文件名');
+        const exists = Object.hasOwn(room.files, message.fileName);
+        if (message.type === 'file-create' ? exists : !exists) return rejectEdit('文件状态已变化，请重试');
+        if (message.type === 'code' && typeof message.code !== 'string') return;
+        if (message.type === 'file-delete' && Object.keys(room.files).length <= 1) return rejectEdit('至少需要保留一个代码文件');
+        if (message.type === 'test-cases' && !isTestCases(message.testCases)) return rejectEdit('无效测试用例');
+      }
       if (message.type === 'code' && isCppFileName(message.fileName) && typeof message.code === 'string' && Object.hasOwn(room.files, message.fileName)) room.files[message.fileName] = message.code;
       if (message.type === 'file-create' && isCppFileName(message.fileName) && !Object.hasOwn(room.files, message.fileName)) {
         room.files[message.fileName] = typeof message.code === 'string' ? message.code : defaultCode();
         room.testCasesByFile[message.fileName] = defaultTestCases();
         message = { type: 'file-created', fileName: message.fileName, code: room.files[message.fileName] };
+      }
+      if (message.type === 'file-delete' && isCppFileName(message.fileName) && Object.hasOwn(room.files, message.fileName) && Object.keys(room.files).length > 1) {
+        delete room.files[message.fileName];
+        delete room.testCasesByFile[message.fileName];
+        message = { type: 'file-deleted', fileName: message.fileName };
       }
       if (message.type === 'stroke' && message.stroke) room.strokes.push(message.stroke);
       if (message.type === 'board-update' && message.item?.id) {
@@ -177,14 +215,22 @@ wss.on('connection', (socket, request) => {
       if (message.type === 'test-cases' && isCppFileName(message.fileName) && isTestCases(message.testCases)) {
         room.testCasesByFile[message.fileName] = message.testCases;
       }
-      for (const client of room.clients) if (client !== socket && client.readyState === 1) client.send(JSON.stringify(message));
+      if (message.type === 'chat' && typeof message.text === 'string' && message.text.trim()) {
+        message = { type: 'chat', id: randomBytes(6).toString('hex'), name, text: message.text.trim().slice(0, 1000), time: Date.now() };
+        room.messages.push(message);
+        if (room.messages.length > 100) room.messages.splice(0, room.messages.length - 100);
+      }
+      if (!['code', 'file-created', 'file-deleted', 'test-cases', 'stroke', 'board-update', 'clear', 'chat'].includes(message.type)) return;
+      if (message.type === 'file-deleted') message.files = room.files;
+      for (const client of room.clients) if ((client !== socket || ['chat', 'file-created', 'file-deleted'].includes(message.type)) && client.readyState === 1) client.send(JSON.stringify(message));
     } catch { /* Ignore malformed messages from a browser. */ }
   });
   socket.on('close', () => {
     room.clients.delete(socket);
+    if (room.editor?.peerId === peerId) { room.editor = null; broadcastEditState(); }
     for (const client of room.clients) if (client.readyState === 1) client.send(JSON.stringify({ type: 'peer-left', peerId }));
   });
 });
 
 app.get('*', (_req, res) => res.sendFile(path.join(clientRoot, 'index.html')));
-server.listen(PORT, () => console.log(`VP server listening at http://localhost:${PORT}`));
+server.listen(PORT, () => console.log(`VP server listening at http://localhost:${server.address().port}`));
